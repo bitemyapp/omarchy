@@ -2,6 +2,12 @@
 
 Omarchy enables suspend and hibernation by default, but if you're having issues with either on your machine, you can toggle them off.
 
+### Docked laptops
+
+With an external monitor physically connected, Omarchy keeps the normal docked lid policy in effect while the screen is blanked and while moving between the desktop and login screen. Closing the laptop lid will not suspend the machine during those transitions.
+
+Disconnecting the external monitor restores normal lid handling within about a second. Explicit suspend commands and idle settings still apply while docked. If an administrator changes logind's `HandleLidSwitchDocked` away from `ignore`, Omarchy respects that setting.
+
 ### Power profiles
 
 On a laptop, Omarchy remembers your power profile separately for plugged in and running on battery, and switches between the two as you plug and unplug. Out of the box that means performance on AC and balanced on battery.

@@ -1,0 +1,30 @@
+#!/bin/bash
+
+# omarchy:summary=Keep lid handling docked while an external monitor is connected
+# omarchy:group=system
+# omarchy:hidden=true
+
+set -euo pipefail
+
+docked_lid_ignored() {
+  [[ $(busctl --system get-property org.freedesktop.login1 /org/freedesktop/login1 \
+    org.freedesktop.login1.Manager HandleLidSwitchDocked) == 's "ignore"' ]]
+}
+
+if [[ ${1:-} == "--inhibited" ]]; then
+  # Recheck after acquiring the lock, including a disconnect during acquisition.
+  while docked_lid_ignored && omarchy-hw-external-monitors; do
+    sleep 1
+  done
+else
+  while ! docked_lid_ignored || ! omarchy-hw-external-monitors; do
+    sleep 1
+  done
+
+  # logind counts enabled outputs, which disappear during compositor teardown
+  # and DPMS. Physical connection is Omarchy's clamshell policy. A system service
+  # keeps that policy in effect between the desktop and the display manager.
+  # Only lid handling is inhibited: explicit suspend and idle policy still work.
+  exec systemd-inhibit --what=handle-lid-switch --mode=block --who=Omarchy \
+    --why="External monitor connected" "$0" --inhibited
+fi
