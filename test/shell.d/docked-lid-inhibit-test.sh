@@ -84,23 +84,55 @@ status=0
 pass "explicit docked suspend policy is never overridden"
 
 # Upgrade is machine-wide but migrations run once for each user.
+export OMARCHY_PATH="$ROOT"
+unit_source="$ROOT/default/systemd/system/omarchy-docked-lid-inhibit.service"
 cat >"$tmpdir/bin/systemctl" <<'SH'
 #!/bin/bash
 if [[ $1 == is-enabled ]]; then
   [[ -e $TEST_STATE/enabled ]]
-else
+elif [[ $1 == daemon-reload || ${!#} == "omarchy-docked-lid-inhibit.service" ]]; then
   echo "$*" >>"$CALL_LOG"
-  [[ $1 != enable ]] || touch "$TEST_STATE/enabled"
+  if [[ $1 == enable ]]; then
+    [[ -f $TEST_STATE/unit ]] || exit 1
+    touch "$TEST_STATE/enabled"
+  fi
 fi
+SH
+cat >"$tmpdir/bin/install" <<'SH'
+#!/bin/bash
+set -euo pipefail
+[[ $1 == "-Dm644" && $2 == "$OMARCHY_PATH/default/systemd/system/omarchy-docked-lid-inhibit.service" &&
+  $3 == "/etc/systemd/system/omarchy-docked-lid-inhibit.service" ]] || exit 1
+echo install >>"$CALL_LOG"
+[[ ${INSTALL_FAIL:-0} == "0" ]] || exit 19
+exec /usr/bin/install "$1" "$2" "$TEST_STATE/unit"
 SH
 cat >"$tmpdir/bin/sudo" <<'SH'
 #!/bin/bash
 exec "$@"
 SH
-chmod +x "$tmpdir/bin/systemctl" "$tmpdir/bin/sudo"
+chmod +x "$tmpdir/bin/systemctl" "$tmpdir/bin/install" "$tmpdir/bin/sudo"
 : >"$CALL_LOG"
 bash -euo pipefail "$ROOT/migrations/1790703856.sh"
 bash -euo pipefail "$ROOT/migrations/1790703856.sh"
-[[ $(<"$CALL_LOG") == $'daemon-reload\nenable --now omarchy-docked-lid-inhibit.service' ]] ||
-  fail "migration must enable once without restarting existing services"
-pass "migration is idempotent across users"
+[[ $(<"$CALL_LOG") == $'install\ndaemon-reload\nenable --now omarchy-docked-lid-inhibit.service' ]] ||
+  fail "migration must install before enabling and no-op for another user"
+cmp -s "$unit_source" "$TEST_STATE/unit" || fail "migration installs the shipped system unit"
+[[ $(stat -c %a "$TEST_STATE/unit") == "644" ]] || fail "migration installs the system unit with mode 0644"
+pass "migration installs the system unit before enabling and is idempotent across users"
+
+rm "$TEST_STATE/unit" "$TEST_STATE/enabled"
+: >"$CALL_LOG"
+bash -euo pipefail "$ROOT/install/config/enable-services.sh"
+[[ $(<"$CALL_LOG") == $'install\nenable omarchy-docked-lid-inhibit.service' ]] ||
+  fail "fresh installation must install before enabling without starting or reloading services"
+cmp -s "$unit_source" "$TEST_STATE/unit" || fail "fresh installation installs the shipped system unit"
+pass "fresh installation installs the unit and enables it for the next boot"
+
+rm "$TEST_STATE/unit" "$TEST_STATE/enabled"
+: >"$CALL_LOG"
+status=0
+INSTALL_FAIL=1 bash -euo pipefail "$ROOT/migrations/1790703856.sh" || status=$?
+[[ $status == 19 && $(<"$CALL_LOG") == "install" && ! -e $TEST_STATE/enabled ]] ||
+  fail "failed unit installation must leave the migration pending without enabling the service"
+pass "failed unit installation stops the migration before activation"
