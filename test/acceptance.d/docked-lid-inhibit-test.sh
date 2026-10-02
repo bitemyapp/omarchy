@@ -16,6 +16,11 @@ done
 pass "docked lid helpers are package-owned and available in the service PATH"
 
 unit=omarchy-docked-lid-inhibit.service
+pacman -Qo "/usr/lib/systemd/system/$unit" >/dev/null || fail "docked lid unit is package-owned"
+[[ $(systemctl show --property=FragmentPath --value "$unit") == "/usr/lib/systemd/system/$unit" ]] ||
+  fail "docked lid protection uses the updatable vendor unit"
+[[ $(systemctl show --property=Type --value "$unit") == "notify" ]] || fail "docked lid protection waits for readiness"
+pass "docked lid protection uses the package-owned vendor unit and readiness notification"
 systemctl is-enabled --quiet "$unit" || fail "docked lid protection is enabled after installation or update"
 wait_until "docked lid protection is running after installation or update" 10 systemctl is-active --quiet "$unit"
 

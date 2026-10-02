@@ -12,15 +12,25 @@ monitor="$ROOT/bin/omarchy-system-docked-lid-inhibit"
 
 cat >"$tmpdir/bin/busctl" <<'SH'
 #!/bin/bash
+[[ $SCENARIO != "query-failure" ]] || exit 17
 printf 's "%s"\n' "$(<"$TEST_STATE/policy")"
 SH
 cat >"$tmpdir/bin/systemd-inhibit" <<'SH'
 #!/bin/bash
+[[ $SCENARIO != "acquire-failure" ]] || exit 27
+[[ $SCENARIO != "delayed-acquire" ]] || sleep 1
 printf 'acquired %s\n' "$*" >>"$CALL_LOG"
 while [[ $1 == --* ]]; do shift; done
-[[ ${SCENARIO:-} == "disconnect-during-acquire" ]] && echo disconnected >"$OMARCHY_DRM_PATH/card0-DP-1/status"
+[[ $SCENARIO != "disconnect-during-acquire" ]] || echo disconnected >"$OMARCHY_DRM_PATH/card0-DP-1/status"
+# Newer systemd forks remove this from the inherited environment.
+unset NOTIFY_SOCKET
 "$@"
 echo released >>"$CALL_LOG"
+SH
+cat >"$tmpdir/bin/systemd-notify" <<'SH'
+#!/bin/bash
+[[ $1 == "--ready" ]] || exit 1
+echo ready >>"$CALL_LOG"
 SH
 cat >"$tmpdir/bin/sleep" <<'SH'
 #!/bin/bash
@@ -29,7 +39,8 @@ echo "$((count + 1))" >"$TEST_STATE/count"
 echo tick >>"$CALL_LOG"
 case "$SCENARIO:$count" in
   connect:0) echo connected >"$OMARCHY_DRM_PATH/card0-DP-1/status" ;;
-  connect:1 | docked:0) echo disconnected >"$OMARCHY_DRM_PATH/card0-DP-1/status" ;;
+  connect:1 | docked:0 | delayed-acquire:1) echo disconnected >"$OMARCHY_DRM_PATH/card0-DP-1/status" ;;
+  delayed-acquire:0) : ;;
   policy:0) echo suspend >"$TEST_STATE/policy" ;;
   disabled:0) exit 23 ;;
   *) exit 24 ;;
@@ -38,7 +49,7 @@ SH
 chmod +x "$tmpdir/bin/"*
 
 reset_scenario() {
-  export SCENARIO="$1"
+  export SCENARIO="$1" NOTIFY_SOCKET="$tmpdir/notify"
   : >"$CALL_LOG"
   echo 0 >"$TEST_STATE/count"
   echo ignore >"$TEST_STATE/policy"
@@ -47,92 +58,59 @@ reset_scenario() {
   echo disabled >"$OMARCHY_DRM_PATH/card0-DP-1/enabled"
 }
 
+run_monitor() {
+  local status=0
+  "$monitor" || status=$?
+  [[ $status == "$1" ]] || fail "monitor exits with the expected fixture status" "$status instead of $1"
+  mapfile -t calls <"$CALL_LOG"
+}
+
 reset_scenario docked
-"$monitor"
-mapfile -t calls <"$CALL_LOG"
+run_monitor 24
 [[ ${calls[0]} == 'acquired --what=handle-lid-switch --mode=block --who=Omarchy --why=External monitor connected '* ]] ||
   fail "connected but disabled external display inhibits only lid handling"
-[[ ${calls[1]} == "tick" && ${calls[2]} == "released" && ${#calls[@]} == 3 ]] ||
-  fail "unplug releases the inhibitor on the next poll"
-pass "logout and DPMS do not remove docked protection; unplug restores lid handling"
+[[ ${calls[1]} == "ready" && ${calls[2]} == "tick" && ${calls[3]} == "released" && ${calls[4]} == "tick" ]] ||
+  fail "docked readiness follows acquisition and unplug releases without a service restart"
+pass "docked readiness survives a cleared notify environment; unplug releases and monitoring continues"
 
 reset_scenario connect
 echo disconnected >"$OMARCHY_DRM_PATH/card0-DP-1/status"
-"$monitor"
-mapfile -t calls <"$CALL_LOG"
-[[ ${calls[0]} == "tick" && ${calls[1]} == acquired* && ${calls[3]} == "released" ]] ||
-  fail "internal display alone does not inhibit; hotplug acquires the inhibitor"
-pass "undocked lid handling is preserved and external hotplug acquires protection"
+run_monitor 24
+[[ ${calls[0]} == "ready" && ${calls[1]} == "tick" && ${calls[2]} == acquired* && ${calls[4]} == "released" ]] ||
+  fail "undocked startup must be ready without an inhibitor and hotplug must acquire one"
+[[ $(grep -c '^ready$' "$CALL_LOG") == "1" ]] || fail "hotplug must not repeat startup notification"
+pass "undocked startup is ready promptly and external hotplug acquires protection"
+
+reset_scenario delayed-acquire
+run_monitor 24
+[[ ${calls[0]} == "tick" && ${calls[1]} == acquired* && ${calls[2]} == "ready" ]] ||
+  fail "delayed inhibitor acquisition must not send readiness early"
+pass "delayed inhibitor acquisition cannot report readiness before the lock exists"
 
 reset_scenario disconnect-during-acquire
-"$monitor"
-mapfile -t calls <"$CALL_LOG"
-[[ ${calls[0]} == acquired* && ${calls[1]} == "released" && ${#calls[@]} == 2 ]] ||
-  fail "disconnect during acquisition immediately releases protection"
-pass "disconnect race cannot leave a stale inhibitor"
+run_monitor 24
+[[ ${calls[0]} == acquired* && ${calls[1]} == "ready" && ${calls[2]} == "released" && ${#calls[@]} == 4 ]] ||
+  fail "disconnect during acquisition must release protection and still complete startup"
+pass "disconnect race releases the lock without leaving startup blocked"
 
 reset_scenario policy
-"$monitor"
-[[ $(tail -1 "$CALL_LOG") == "released" ]] || fail "policy change releases the inhibitor"
+run_monitor 24
+[[ ${calls[3]} == "released" ]] || fail "policy change releases the inhibitor"
 pass "administrator docked lid policy takes precedence"
 
 reset_scenario disabled
 echo suspend >"$TEST_STATE/policy"
-status=0
-"$monitor" || status=$?
-[[ $status == 23 && $(<"$CALL_LOG") == "tick" ]] || fail "non-ignore policy must not acquire a lock"
-pass "explicit docked suspend policy is never overridden"
+run_monitor 23
+[[ $(<"$CALL_LOG") == $'ready\ntick' ]] || fail "non-ignore policy must report readiness without acquiring a lock"
+pass "explicit docked suspend policy starts promptly without acquiring a lock"
 
-# Upgrade is machine-wide but migrations run once for each user.
-export OMARCHY_PATH="$ROOT"
-unit_source="$ROOT/default/systemd/system/omarchy-docked-lid-inhibit.service"
-cat >"$tmpdir/bin/systemctl" <<'SH'
-#!/bin/bash
-if [[ $1 == is-enabled ]]; then
-  [[ -e $TEST_STATE/enabled ]]
-elif [[ $1 == daemon-reload || ${!#} == "omarchy-docked-lid-inhibit.service" ]]; then
-  echo "$*" >>"$CALL_LOG"
-  if [[ $1 == enable ]]; then
-    [[ -f $TEST_STATE/unit ]] || exit 1
-    touch "$TEST_STATE/enabled"
+for scenario in query-failure acquire-failure; do
+  reset_scenario "$scenario"
+  if [[ $scenario == "query-failure" ]]; then
+    run_monitor 17
+  else
+    run_monitor 27
   fi
-fi
-SH
-cat >"$tmpdir/bin/install" <<'SH'
-#!/bin/bash
-set -euo pipefail
-[[ $1 == "-Dm644" && $2 == "$OMARCHY_PATH/default/systemd/system/omarchy-docked-lid-inhibit.service" &&
-  $3 == "/etc/systemd/system/omarchy-docked-lid-inhibit.service" ]] || exit 1
-echo install >>"$CALL_LOG"
-[[ ${INSTALL_FAIL:-0} == "0" ]] || exit 19
-exec /usr/bin/install "$1" "$2" "$TEST_STATE/unit"
-SH
-cat >"$tmpdir/bin/sudo" <<'SH'
-#!/bin/bash
-exec "$@"
-SH
-chmod +x "$tmpdir/bin/systemctl" "$tmpdir/bin/install" "$tmpdir/bin/sudo"
-: >"$CALL_LOG"
-bash -euo pipefail "$ROOT/migrations/1790703856.sh"
-bash -euo pipefail "$ROOT/migrations/1790703856.sh"
-[[ $(<"$CALL_LOG") == $'install\ndaemon-reload\nenable --now omarchy-docked-lid-inhibit.service' ]] ||
-  fail "migration must install before enabling and no-op for another user"
-cmp -s "$unit_source" "$TEST_STATE/unit" || fail "migration installs the shipped system unit"
-[[ $(stat -c %a "$TEST_STATE/unit") == "644" ]] || fail "migration installs the system unit with mode 0644"
-pass "migration installs the system unit before enabling and is idempotent across users"
-
-rm "$TEST_STATE/unit" "$TEST_STATE/enabled"
-: >"$CALL_LOG"
-bash -euo pipefail "$ROOT/install/config/enable-services.sh"
-[[ $(<"$CALL_LOG") == $'install\nenable omarchy-docked-lid-inhibit.service' ]] ||
-  fail "fresh installation must install before enabling without starting or reloading services"
-cmp -s "$unit_source" "$TEST_STATE/unit" || fail "fresh installation installs the shipped system unit"
-pass "fresh installation installs the unit and enables it for the next boot"
-
-rm "$TEST_STATE/unit" "$TEST_STATE/enabled"
-: >"$CALL_LOG"
-status=0
-INSTALL_FAIL=1 bash -euo pipefail "$ROOT/migrations/1790703856.sh" || status=$?
-[[ $status == 19 && $(<"$CALL_LOG") == "install" && ! -e $TEST_STATE/enabled ]] ||
-  fail "failed unit installation must leave the migration pending without enabling the service"
-pass "failed unit installation stops the migration before activation"
+  [[ ! -s $CALL_LOG ]] || fail "failed logind access must not report readiness"
+done
+pass "logind query and acquisition failures cannot claim readiness"

@@ -5,9 +5,7 @@ After=systemd-logind.service
 Before=display-manager.service
 
 [Service]
-Type=notify
-NotifyAccess=all
-TimeoutStartSec=10
+Type=exec
 # Both Omarchy helpers are installed by the runtime package in /usr/bin.
 Environment=PATH=/usr/bin
 ExecStart=/usr/bin/omarchy-system-docked-lid-inhibit
